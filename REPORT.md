@@ -4,6 +4,8 @@
 **Author:** Aadi Jain  
 **Date:** April 2026
 
+📹 **Video Explanation:** [Watch the solution walkthrough on Google Drive](https://drive.google.com/file/d/19x_OLbXyt8sOJJNcAVsEPRyqeKMsVwjg/view?usp=drive_link)
+
 ---
 
 ## 1. Why L1 on Sigmoid Gates Encourages Sparsity
