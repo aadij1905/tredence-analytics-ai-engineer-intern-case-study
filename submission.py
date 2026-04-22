@@ -1,11 +1,8 @@
-#!/usr/bin/env python3
 """
 Self-Pruning Neural Network on CIFAR-10
-========================================
 Tredence Analytics — AI Engineer Internship Case Study
 
-This script implements a neural network that **learns to prune itself**
-during training.  Every weight in the network is paired with a learnable
+This script implements a neural network that learns to prune itself during training.  Every weight in the network is paired with a learnable
 "gate" parameter.  During the forward pass the gates (passed through
 sigmoid) element-wise multiply the weights, so a gate near 0 effectively
 removes its corresponding weight.  An L1 penalty on the gate values
@@ -14,7 +11,8 @@ sparse network in a single training run.
 
 Two pruning strategies are implemented:
     A. PrunableLinear   — sigmoid gates + L1 regularisation (simple, stable)
-    B. HardConcreteLinear — Hard Concrete gates + L0 regularisation (Louizos 2018)
+    B. HardConcreteLinear — Hard Concrete gates + L0 regularisation 
+    c. prunable cnn each filter has gate
 
 Deliverables produced by running this script:
     1. Training logs for three λ values per method
@@ -23,16 +21,11 @@ Deliverables produced by running this script:
     4. gate_distributions_hardconcrete.png — same for Hard Concrete method
     5. gate_distributions_conv2d.png — same for Conv2d structured pruning method
 
-Author : Aadi Jain
-Date   : April 2026
 """
-
-# ── Imports ───────────────────────────────────────────────────────────
 import math
 from typing import List, Tuple
-
 import matplotlib
-matplotlib.use("Agg")                       # non-interactive backend (works headless)
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -43,19 +36,17 @@ import torchvision
 import torchvision.transforms as transforms
 
 
-# ═══════════════════════════════════════════════════════════════════════
 #  1.  PrunableLinear — The Core Custom Layer
-# ═══════════════════════════════════════════════════════════════════════
 
 class PrunableLinear(nn.Module):
     """
-    Drop-in replacement for ``nn.Linear`` with learnable per-weight gates.
+    Drop-in replacement for nn.Linear with learnable per-weight gates.
 
     For every entry w_ij in the weight matrix we maintain a learnable
-    scalar ``gate_score_ij``.  The forward pass proceeds as:
+    scalar gate_score_ij.  The forward pass proceeds as:
 
-        1.  gates = σ(gate_scores)           # values in (0, 1)
-        2.  pruned_weights = weight ⊙ gates  # element-wise masking
+        1.  gates = sigmoid(gate_scores)--> values in (0, 1)
+        2.  pruned_weights = weight ⊙ gates  (element-wise masking)
         3.  output = x @ pruned_weights^T + bias
 
     When gate_score → −∞ the sigmoid → 0 and the corresponding weight
@@ -78,13 +69,14 @@ class PrunableLinear(nn.Module):
         self.weight = nn.Parameter(torch.empty(out_features, in_features))
         self.bias   = nn.Parameter(torch.zeros(out_features)) if bias else None
 
-        # ── Learnable gate scores (same shape as weight) ──────────────
+        #  Learnable gate scores (same shape as weight) 
         # Initialised to 0 so that σ(0) = 0.5  → all gates start
         # "half-open", giving the optimiser freedom to push them in
         # either direction without initial bias.
         self.gate_scores = nn.Parameter(torch.zeros(out_features, in_features))
 
-        # ── Weight initialisation (Kaiming uniform — nn.Linear default) ─
+        # Weight initialisation (Kaiming uniform — nn.Linear default) 
+        # because variance(w)=2/fan_in and also to keep it stable while using relu 
         nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
         if self.bias is not None:
             fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
@@ -94,10 +86,7 @@ class PrunableLinear(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Forward pass with gated weights.
-
-        The computation graph flows through the sigmoid so that
-        ∂L/∂gate_scores is well-defined and the optimiser can
-        update them.
+        The computation graph flows through the sigmoid so that ∂L/∂gate_scores is well-defined and the optimiser can update them.
         """
         # Step 1 — convert raw scores to [0, 1] gates
         gates = torch.sigmoid(self.gate_scores)
@@ -108,7 +97,7 @@ class PrunableLinear(nn.Module):
         # Step 3 — standard linear transform with masked weights
         return F.linear(x, pruned_weights, self.bias)
 
-    # ── Utility helpers ───────────────────────────────────────────
+    # Utility helpers 
     def get_gates(self) -> torch.Tensor:
         """Return the current gate values as a detached tensor."""
         with torch.no_grad():
@@ -117,9 +106,8 @@ class PrunableLinear(nn.Module):
     def sparsity_loss(self) -> torch.Tensor:
         """
         L1 norm of the sigmoid-activated gate values.
-
         This is the per-layer contribution to the sparsity penalty in
-        the total loss:  L_total = CE + λ · Σ_layers |gates|₁
+        the total loss:  L_total = L_task + λ · Σ_layers |gates|₁
         """
         return torch.sigmoid(self.gate_scores).sum()
 
@@ -130,7 +118,6 @@ class PrunableLinear(nn.Module):
 class PrunableConv2d(nn.Module):
     """
     Conv2d layer with learnable filter-level gates.
-
     Each output channel has one learnable gate score. The sigmoid-activated
     gate scales the whole filter, enabling structured channel pruning.
     """
@@ -182,22 +169,20 @@ class PrunableConv2d(nn.Module):
         )
 
 
-# ═══════════════════════════════════════════════════════════════════════
-#  1b. HardConcreteLinear — Advanced L0 Regularisation (Louizos 2018)
-# ═══════════════════════════════════════════════════════════════════════
+#  1b. HardConcreteLinear — Advanced L0 Regularisation 
 
 class HardConcreteLinear(nn.Module):
     """
-    Linear layer with *Hard Concrete* gates (Louizos et al., 2018).
+    Linear layer with Hard Concrete gates .
 
     Instead of sigmoid + L1, this layer samples binary-like masks from a
     stretched concrete distribution during training.  The expected L0 norm
-    (the *number* of non-zero weights, not their magnitude) is differentiable
+    (the number of non-zero weights, not their magnitude) is differentiable
     and serves as the regulariser.
 
     Key advantages over PrunableLinear:
-        • Produces **exactly zero** masks via hard clipping to [0, 1]
-        • Regularises the *count* of active weights (L0), not their sum (L1)
+        • Produces exactly zero masks via hard clipping to [0, 1]
+        • Regularises the count of active weights (L0), not their sum (L1)
         • No need to choose a post-hoc pruning threshold
 
     At inference time we use the deterministic mask:
@@ -227,7 +212,7 @@ class HardConcreteLinear(nn.Module):
         self.gamma = gamma
         self.zeta = zeta
 
-        # ── Learnable parameters ──────────────────────────────────
+        #  Learnable parameters 
         self.weight = nn.Parameter(torch.empty(out_features, in_features))
         self.bias = nn.Parameter(torch.zeros(out_features)) if bias else None
 
@@ -235,7 +220,7 @@ class HardConcreteLinear(nn.Module):
         # Initialised to 0 → sigmoid(0)=0.5 → gates start ~50% open.
         self.log_alpha = nn.Parameter(torch.zeros(out_features, in_features))
 
-        # ── Weight initialisation ─────────────────────────────────
+        # Weight initialisation 
         nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
         if self.bias is not None:
             fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
@@ -245,7 +230,6 @@ class HardConcreteLinear(nn.Module):
     def _sample_mask(self) -> torch.Tensor:
         """
         Sample from the Hard Concrete distribution (training only).
-
         u ~ Uniform(ε, 1−ε)
         s = sigmoid((log(u) − log(1−u) + log_alpha) / β)
         s_bar = s * (ζ − γ) + γ
@@ -259,7 +243,7 @@ class HardConcreteLinear(nn.Module):
         return s_bar.clamp(0.0, 1.0)
 
     def _deterministic_mask(self) -> torch.Tensor:
-        """Deterministic mask for inference (no sampling)."""
+        # Deterministic mask for inference (no sampling).
         return (
             torch.sigmoid(self.log_alpha)
             * (self.zeta - self.gamma)
@@ -271,11 +255,10 @@ class HardConcreteLinear(nn.Module):
         pruned_weights = self.weight * mask
         return F.linear(x, pruned_weights, self.bias)
 
-    # ── Regularisation & utilities ────────────────────────────────
+    # Regularisation & utilities 
     def sparsity_loss(self) -> torch.Tensor:
         """
         Expected L0 norm — the probability each gate is non-zero.
-
         This is the CDF of the Hard Concrete distribution evaluated
         at zero, summed over all gates.  It counts *how many* weights
         are expected to be active, which is a more principled measure
@@ -286,7 +269,7 @@ class HardConcreteLinear(nn.Module):
         ).sum()
 
     def get_gates(self) -> torch.Tensor:
-        """Return the deterministic gate values as a detached tensor."""
+        # Return the deterministic gate values as a detached tensor
         return self._deterministic_mask().detach()
 
     def extra_repr(self) -> str:
@@ -296,14 +279,13 @@ class HardConcreteLinear(nn.Module):
         )
 
 
-# ═══════════════════════════════════════════════════════════════════════
+
 #  2.  SelfPruningNet — CIFAR-10 Classifier
-# ═══════════════════════════════════════════════════════════════════════
+
 
 class SelfPruningNet(nn.Module):
     """
     Feed-forward classifier built entirely from PrunableLinear layers.
-
     Architecture
     ------------
         Flatten(3×32×32 = 3072)
@@ -311,15 +293,14 @@ class SelfPruningNet(nn.Module):
           → PrunableLinear( 512, 256)  → BatchNorm → ReLU
           → PrunableLinear( 256, 128)  → BatchNorm → ReLU
           → PrunableLinear( 128,  10)  → (logits, no activation)
-
     Total learnable parameters ≈ 1.86 M (half are gate scores).
+    can increase the layers to increase accuracy.
     """
 
     def __init__(self):
         super().__init__()
         self.flatten = nn.Flatten()
 
-        # Every linear layer is prunable
         self.layers = nn.ModuleList([
             PrunableLinear(3 * 32 * 32, 512),   # 3072 → 512
             PrunableLinear(512, 256),            #  512 → 256
@@ -341,19 +322,19 @@ class SelfPruningNet(nn.Module):
             x = layer(x)                        # PrunableLinear
             x = self.bns[i](x)                  # BatchNorm
             x = self.relu(x)                    # ReLU
-        return self.layers[-1](x)               # final layer → raw logits
+        return self.layers[-1](x)               
 
-    # ── Gate aggregation helpers ──────────────────────────────────
+    #  Gate aggregation helpers 
     def total_sparsity_loss(self) -> torch.Tensor:
-        """Sum of L1(gates) across all PrunableLinear layers."""
+        # Sum of L1(gates) across all PrunableLinear layers.
         return sum(layer.sparsity_loss() for layer in self.layers)
 
     def all_gates(self) -> torch.Tensor:
-        """Concatenate all gate values into a single flat tensor."""
+        # Concatenate all gate values into a single flat tensor
         return torch.cat([layer.get_gates().flatten() for layer in self.layers])
 
     def sparsity_level(self, threshold: float = 1e-2) -> float:
-        """Fraction of gates below ``threshold`` (= effectively pruned)."""
+        # Fraction of gates below hreshold (= effectively pruned)
         gates = self.all_gates()
         return (gates < threshold).float().mean().item()
 
@@ -415,6 +396,7 @@ class ConvPruningNet(nn.Module):
       Conv(64->128, k3) -> BN -> ReLU
       AdaptiveAvgPool(1x1)
       PrunableLinear(128->10)
+      can increase the layers to increase accuracy.
     """
 
     def __init__(self):
@@ -459,9 +441,9 @@ class ConvPruningNet(nn.Module):
         return (gates < threshold).float().mean().item()
 
 
-# ═══════════════════════════════════════════════════════════════════════
+
 #  3.  Data Loading — CIFAR-10
-# ═══════════════════════════════════════════════════════════════════════
+
 
 def get_cifar10_loaders(batch_size: int = 256) -> Tuple:
     """
@@ -499,9 +481,9 @@ def get_cifar10_loaders(batch_size: int = 256) -> Tuple:
     return train_loader, test_loader
 
 
-# ═══════════════════════════════════════════════════════════════════════
+
 #  4.  Training & Evaluation
-# ═══════════════════════════════════════════════════════════════════════
+
 
 def train_one_epoch(
     model: nn.Module,
@@ -513,9 +495,7 @@ def train_one_epoch(
 ) -> Tuple[float, float]:
     """
     Train for one epoch with the composite loss:
-
         L = CrossEntropy(logits, labels) + λ · Σ|gates|
-
     Returns (avg_cls_loss, avg_total_loss).
     """
     model.train()
@@ -524,11 +504,11 @@ def train_one_epoch(
     for images, labels in loader:
         images, labels = images.to(device), labels.to(device)
 
-        optimizer.zero_grad(set_to_none=True)   # slightly faster than zero_grad()
+        optimizer.zero_grad(set_to_none=True)   
 
         logits = model(images)
 
-        # ── Composite loss ─────────────────────────────────────────
+        # Composite loss 
         cls_loss      = criterion(logits, labels)          # classification
         sparsity_loss = lam * model.total_sparsity_loss()  # L1 on gates
         loss          = cls_loss + sparsity_loss
@@ -553,7 +533,7 @@ def evaluate(
     loader: torch.utils.data.DataLoader,
     device: torch.device,
 ) -> float:
-    """Return test accuracy as a fraction in [0, 1]."""
+    # Return test accuracy as a fraction in [0, 1]
     model.eval()
     correct = total = 0
     for images, labels in loader:
@@ -661,9 +641,9 @@ def train_and_evaluate(
     }
 
 
-# ═══════════════════════════════════════════════════════════════════════
+
 #  5.  Visualisation & Reporting
-# ═══════════════════════════════════════════════════════════════════════
+
 
 def plot_gate_distributions(results: List[dict], save_path: str = "gate_distributions.png"):
     """
@@ -709,7 +689,7 @@ def plot_gate_distributions(results: List[dict], save_path: str = "gate_distribu
     )
     plt.tight_layout()
     fig.savefig(save_path, dpi=200, bbox_inches="tight")
-    print(f"\n  📊 Plot saved → {save_path}")
+    print(f"\n   Plot saved → {save_path}")
     return fig
 
 
@@ -728,30 +708,23 @@ def print_results_table(results: List[dict], title: str = "Results Summary") -> 
     print()
 
 
-# ═══════════════════════════════════════════════════════════════════════
-#  6.  Main — Run the Full Experiment
-# ═══════════════════════════════════════════════════════════════════════
 
-if __name__ == "__main__":
-    # ── Reproducibility ───────────────────────────────────────────
+#  6.  Main — Run the Full Experiment
+
+
+if __name__ == "__main__": 
     torch.manual_seed(42)
     np.random.seed(42)
-
-    # ── Device selection ──────────────────────────────────────────
     if torch.cuda.is_available():
         DEVICE = torch.device("cuda")
     elif torch.backends.mps.is_available():
         DEVICE = torch.device("mps")
     else:
         DEVICE = torch.device("cpu")
-
-    # ── Experiment config ─────────────────────────────────────────
-    EPOCHS  = 50                           # increase to 30+ for better accuracy
+    EPOCHS  = 50                           # increase to 100+ for better accuracy
     LAMBDAS = [1e-6, 1e-5, 1e-4]          # low / medium / high sparsity pressure
 
-    # ══════════════════════════════════════════════════════════════
-    #  Method A — Sigmoid + L1 (core method)
-    # ══════════════════════════════════════════════════════════════
+    #  Method A — MLP
     print("\n" + "#" * 60)
     print("#  METHOD A: PrunableLinear (Sigmoid + L1)")
     print("#" * 60)
@@ -766,9 +739,7 @@ if __name__ == "__main__":
     print_results_table(sigmoid_results, title="Sigmoid + L1 Results")
     plot_gate_distributions(sigmoid_results, save_path="gate_distributions.png")
 
-    # ══════════════════════════════════════════════════════════════
     #  Method B — Hard Concrete + L0 (advanced extension)
-    # ══════════════════════════════════════════════════════════════
     print("\n" + "#" * 60)
     print("#  METHOD B: HardConcreteLinear (L0 Regularisation)")
     print("#" * 60)
@@ -783,9 +754,7 @@ if __name__ == "__main__":
     print_results_table(hc_results, title="Hard Concrete + L0 Results")
     plot_gate_distributions(hc_results, save_path="gate_distributions_hardconcrete.png")
 
-    # ══════════════════════════════════════════════════════════════
     #  Method C — PrunableConv2d + L1 (structured pruning)
-    # ══════════════════════════════════════════════════════════════
     print("\n" + "#" * 60)
     print("#  METHOD C: PrunableConv2d (Structured Sigmoid + L1)")
     print("#" * 60)
@@ -800,9 +769,7 @@ if __name__ == "__main__":
     print_results_table(conv2d_results, title="PrunableConv2d + L1 Results")
     plot_gate_distributions(conv2d_results, save_path="gate_distributions_conv2d.png")
 
-    # ══════════════════════════════════════════════════════════════
     #  Combined comparison
-    # ══════════════════════════════════════════════════════════════
     print_results_table(
         sigmoid_results + hc_results + conv2d_results,
         title="Combined Comparison: Sigmoid+L1 vs HardConcrete+L0 vs PrunableConv2d+L1"
