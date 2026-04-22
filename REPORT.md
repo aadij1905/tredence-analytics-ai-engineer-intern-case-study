@@ -120,7 +120,53 @@ L1 regularisation penalises the *magnitude* of gates, which means a gate at 0.3 
 
 ---
 
-## 6. Comparison of All Methods
+## 6. Structured Pruning: PrunableConv2d (Channel-Level Gates)
+
+As a third extension, we implement **structured channel pruning** using a custom `PrunableConv2d` layer paired with a CNN architecture.
+
+### How it differs from PrunableLinear
+
+| Property | PrunableLinear | PrunableConv2d |
+|----------|---------------|----------------|
+| **Gate granularity** | One gate per weight (unstructured) | One gate per **output channel** (structured) |
+| **What gets pruned** | Individual weight connections | **Entire convolutional filters** |
+| **Gate shape** | `(out_features, in_features)` | `(out_channels, 1, 1, 1)` — broadcasts over the filter |
+| **Inference speedup** | Theoretical only (sparse matrices) | **Real** — physically removes dead channels |
+| **Parameter count** | ~1.8M gates for our MLP | Only 224 gates (32 + 64 + 128 channels) |
+
+### How it works
+
+Each output channel of a Conv2d layer has a single learnable gate score. During the forward pass:
+
+```
+gates = σ(gate_scores)                      # shape: (out_channels, 1, 1, 1)
+pruned_weights = weight × gates             # broadcasts: zeros out entire filters
+output = Conv2d(input, pruned_weights)
+```
+
+If a channel's gate goes to zero, the **entire filter** (all `in_channels × kH × kW` weights) is zeroed out, along with its corresponding output feature map. This is called **structured pruning** because it removes entire structural units rather than random individual weights.
+
+### Why structured pruning matters
+
+Unstructured pruning (PrunableLinear) creates sparse weight matrices with scattered zeros. While this reduces the mathematical parameter count, GPUs cannot skip random zero entries — they still process full dense matrices. The speedup is only theoretical.
+
+Structured pruning (PrunableConv2d) removes **entire channels**. After training, you can physically reshape the weight tensor from, say, `(64, 32, 3, 3)` down to `(18, 32, 3, 3)` if 46 channels were pruned. This gives **real, measurable inference speedups** on any hardware.
+
+### Results
+
+The CNN with structured pruning achieved the highest accuracy across all methods:
+
+| λ | Accuracy | Sparsity | Channels Pruned |
+|---|----------|----------|-----------------|
+| 1e-6 | **77.68%** | 0.60% | ~1 of 224 |
+| 1e-5 | **77.57%** | 3.66% | ~8 of 224 |
+| 1e-4 | **77.19%** | 44.41% | ~99 of 224 |
+
+At λ=1e-4, the network prunes nearly half its channels while losing less than 0.5% accuracy compared to λ=1e-6. This demonstrates that CNNs have significant redundancy at the channel level that can be safely removed.
+
+---
+
+## 7. Comparison of All Methods
 
 ### Results
 
@@ -139,16 +185,17 @@ L1 regularisation penalises the *magnitude* of gates, which means a gate at 0.3 
 **Plot 3: PrunableConv2d (Structured Channel Pruning)**
 ![PrunableConv2d+L1 Gate Distributions](gate_distributions_conv2d.png)
 
-
-
 ### Analysis
 
-1. **Sigmoid+L1** produces a smooth, heavy-tailed distribution — gates decay gradually from 0 toward higher values. This makes the pruning "soft" and requires a threshold to decide which gates are truly pruned.
+1. **Sigmoid+L1 (MLP)** produces a smooth, heavy-tailed distribution — gates decay gradually from 0 toward higher values. This makes the pruning "soft" and requires a threshold to decide which gates are truly pruned.
 
-2. **Hard Concrete+L0** produces a distribution dominated by **exact zeros**. Because of the hard clamp at `[0, 1]`, gates that are pruned become exactly 0.0 (the massive spike at 0). The retained weights do not pile up at 1.0; instead, they are spread across the `(0, 1)` interval because the L0 penalty constantly pulls them downward while the classification loss keeps them just open enough to be useful.
+2. **Hard Concrete+L0 (MLP)** produces a distribution dominated by **exact zeros**. Because of the hard clamp at `[0, 1]`, gates that are pruned become exactly 0.0 (the massive spike at 0). The retained weights do not pile up at 1.0; instead, they are spread across the `(0, 1)` interval because the L0 penalty constantly pulls them downward while the classification loss keeps them just open enough to be useful.
 
-3. For the same λ, the two methods are **not directly comparable** because they optimise different objectives. The L0 penalty counts active weights (a dimensionless number), while the L1 penalty sums their magnitudes. To achieve similar sparsity levels, the methods may need different λ scales.
+3. **PrunableConv2d (CNN)** has far fewer gates (224 vs ~1.8M) because each gate controls an entire channel rather than a single weight. The gate distribution at low λ shows most gates near 1.0 (channels fully open), with only a few near 0. At λ=1e-4, a clear bimodal split emerges — some channels are fully pruned while retained channels stay strongly active.
 
-4. **When to use which:**
-   - **Sigmoid+L1** is simpler, has fewer hyperparameters, and is easier to tune. Recommended as the default.
-   - **Hard Concrete+L0** is theoretically more principled and produces cleaner binary masks. Recommended when you need exact zero masks for hardware-level sparsity acceleration.
+4. For the same λ, the three methods are **not directly comparable** because they optimise different objectives and have vastly different gate counts. The L0 penalty counts active weights, the L1 penalty sums their magnitudes, and the Conv2d L1 penalty operates on only 224 channel-level gates.
+
+5. **When to use which:**
+   - **Sigmoid+L1 (PrunableLinear)** — Simplest approach, good for understanding the pruning mechanism. Best for fully-connected layers.
+   - **Hard Concrete+L0 (HardConcreteLinear)** — More principled, produces exact binary masks. Best when you need mathematically clean zero/non-zero decisions.
+   - **PrunableConv2d** — Best for image tasks. Achieves the highest accuracy (77%+ vs ~63%) and produces **real inference speedups** by physically removing dead channels.
