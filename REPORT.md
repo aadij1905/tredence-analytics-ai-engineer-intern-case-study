@@ -48,6 +48,7 @@ The convolutional structured-pruning variant gives the best accuracy across all 
 
 ## 3. Gate Distribution Plot
 
+**Plot: PrunableLinear (Sigmoid + L1 Baseline)**
 ![Gate Distributions](gate_distributions.png)
 
 The plot shows the distribution of final gate values (after sigmoid) for each λ:
@@ -127,10 +128,13 @@ L1 regularisation penalises the *magnitude* of gates, which means a gate at 0.3 
 
 ### Gate Distribution Comparison
 
+**Plot 1: PrunableLinear (Sigmoid + L1)**
 ![Sigmoid+L1 Gate Distributions](gate_distributions.png)
 
+**Plot 2: HardConcreteLinear (L0 Regularisation)**
 ![Hard Concrete+L0 Gate Distributions](gate_distributions_hardconcrete.png)
 
+**Plot 3: PrunableConv2d (Structured Channel Pruning)**
 ![PrunableConv2d+L1 Gate Distributions](gate_distributions_conv2d.png)
 
 
